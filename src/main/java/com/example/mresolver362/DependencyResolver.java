@@ -88,7 +88,6 @@ final class DependencyResolver {
 		try {
 			ServiceLocator serviceLocator = createServiceLocator();
 			DefaultRepositorySystemSession session = MavenRepositorySystemUtils.newSession();
-			session.setIgnoreArtifactDescriptorRepositories(true);
 			session.setArtifactDescriptorPolicy(new SimpleArtifactDescriptorPolicy(false, false));
 			this.localRepositoryLocation = Files.createTempDirectory("metadata-validation-m2");
 			LocalRepository localRepository = new LocalRepository(this.localRepositoryLocation.toFile());
@@ -136,7 +135,7 @@ final class DependencyResolver {
 
 				@Override
 				public boolean visitLeave(DependencyNode node) {
-					return false;
+					return true;
 				}
 			};
 			result.getRoot().accept(new FilteringDependencyVisitor(collector, filter));
