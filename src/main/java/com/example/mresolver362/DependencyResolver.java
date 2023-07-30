@@ -34,8 +34,13 @@ import org.eclipse.aether.RepositorySystem;
 import org.eclipse.aether.RepositorySystemSession;
 import org.eclipse.aether.artifact.DefaultArtifact;
 import org.eclipse.aether.collection.CollectRequest;
+import org.eclipse.aether.collection.CollectResult;
+import org.eclipse.aether.collection.DependencyCollectionException;
 import org.eclipse.aether.connector.basic.BasicRepositoryConnectorFactory;
 import org.eclipse.aether.graph.Dependency;
+import org.eclipse.aether.graph.DependencyFilter;
+import org.eclipse.aether.graph.DependencyNode;
+import org.eclipse.aether.graph.DependencyVisitor;
 import org.eclipse.aether.impl.DefaultServiceLocator;
 import org.eclipse.aether.internal.impl.DefaultRepositorySystem;
 import org.eclipse.aether.repository.LocalRepository;
@@ -44,21 +49,13 @@ import org.eclipse.aether.repository.RemoteRepository.Builder;
 import org.eclipse.aether.repository.RepositoryPolicy;
 import org.eclipse.aether.resolution.ArtifactDescriptorException;
 import org.eclipse.aether.resolution.ArtifactDescriptorRequest;
-import org.eclipse.aether.resolution.ArtifactResult;
-import org.eclipse.aether.resolution.DependencyRequest;
-import org.eclipse.aether.resolution.DependencyResolutionException;
-import org.eclipse.aether.resolution.DependencyResult;
 import org.eclipse.aether.spi.connector.RepositoryConnectorFactory;
-import org.eclipse.aether.spi.connector.transport.GetTask;
-import org.eclipse.aether.spi.connector.transport.PeekTask;
-import org.eclipse.aether.spi.connector.transport.PutTask;
-import org.eclipse.aether.spi.connector.transport.Transporter;
 import org.eclipse.aether.spi.connector.transport.TransporterFactory;
 import org.eclipse.aether.spi.locator.ServiceLocator;
-import org.eclipse.aether.transfer.NoTransporterException;
 import org.eclipse.aether.transport.http.HttpTransporterFactory;
 import org.eclipse.aether.util.artifact.JavaScopes;
 import org.eclipse.aether.util.filter.DependencyFilterUtils;
+import org.eclipse.aether.util.graph.visitor.FilteringDependencyVisitor;
 import org.eclipse.aether.util.repository.SimpleArtifactDescriptorPolicy;
 
 import org.springframework.util.FileSystemUtils;
@@ -123,20 +120,28 @@ final class DependencyResolver {
 		List<Dependency> managedDependencies = instance.getManagedDependencies(boms, repositories);
 		Dependency aetherDependency = new Dependency(new DefaultArtifact(groupId, artifactId, "pom",
 				instance.getVersion(groupId, artifactId, version, managedDependencies)), "compile");
-		CollectRequest collectRequest = new CollectRequest((Dependency) null,
-				Collections.singletonList(aetherDependency), repositories);
+		CollectRequest collectRequest = new CollectRequest(aetherDependency, repositories);
 		collectRequest.setManagedDependencies(managedDependencies);
-		DependencyRequest dependencyRequest = new DependencyRequest(collectRequest,
-				DependencyFilterUtils.classpathFilter(JavaScopes.COMPILE, JavaScopes.RUNTIME));
 		try {
-			return instance.resolveDependencies(dependencyRequest)
-					.getArtifactResults()
-					.stream()
-					.map(ArtifactResult::getArtifact)
-					.map((artifact) -> artifact.getGroupId() + ":" + artifact.getArtifactId())
-					.collect(Collectors.toList());
+			CollectResult result = instance.collectDependencies(collectRequest);
+
+			DependencyFilter filter = DependencyFilterUtils.classpathFilter(JavaScopes.COMPILE, JavaScopes.RUNTIME);
+			final ArrayList<String> GAs = new ArrayList<>();
+			DependencyVisitor collector = new DependencyVisitor() {
+				@Override
+				public boolean visitEnter(DependencyNode node) {
+					return GAs.add(node.getDependency().getArtifact().getGroupId() + ":" + node.getDependency().getArtifact().getArtifactId());
+				}
+
+				@Override
+				public boolean visitLeave(DependencyNode node) {
+					return true;
+				}
+			};
+			result.getRoot().accept(new FilteringDependencyVisitor(collector, filter));
+			return GAs;
 		}
-		catch (DependencyResolutionException ex) {
+		catch (DependencyCollectionException ex) {
 			throw new RuntimeException(ex);
 		}
 	}
@@ -183,9 +188,9 @@ final class DependencyResolver {
 		}
 	}
 
-	private DependencyResult resolveDependencies(DependencyRequest dependencyRequest)
-			throws DependencyResolutionException {
-		DependencyResult resolved = this.repositorySystem.resolveDependencies(this.repositorySystemSession,
+	private CollectResult collectDependencies(CollectRequest dependencyRequest)
+			throws DependencyCollectionException {
+		CollectResult resolved = this.repositorySystem.collectDependencies(this.repositorySystemSession,
 				dependencyRequest);
 		return resolved;
 	}
@@ -208,63 +213,7 @@ final class DependencyResolver {
 		DefaultServiceLocator locator = MavenRepositorySystemUtils.newServiceLocator();
 		locator.addService(RepositorySystem.class, DefaultRepositorySystem.class);
 		locator.addService(RepositoryConnectorFactory.class, BasicRepositoryConnectorFactory.class);
-		locator.addService(TransporterFactory.class, JarSkippingHttpTransporterFactory.class);
+		locator.addService(TransporterFactory.class, HttpTransporterFactory.class);
 		return locator;
 	}
-
-	private static class JarSkippingHttpTransporterFactory implements TransporterFactory {
-
-		private final HttpTransporterFactory delegate = new HttpTransporterFactory();
-
-		@Override
-		public Transporter newInstance(RepositorySystemSession session, RemoteRepository repository)
-				throws NoTransporterException {
-			return new JarGetSkippingTransporter(this.delegate.newInstance(session, repository));
-		}
-
-		@Override
-		public float getPriority() {
-			return 5.0f;
-		}
-
-		private static final class JarGetSkippingTransporter implements Transporter {
-
-			private final Transporter delegate;
-
-			private JarGetSkippingTransporter(Transporter delegate) {
-				this.delegate = delegate;
-			}
-
-			@Override
-			public int classify(Throwable error) {
-				return this.delegate.classify(error);
-			}
-
-			@Override
-			public void peek(PeekTask task) throws Exception {
-				this.delegate.peek(task);
-			}
-
-			@Override
-			public void get(GetTask task) throws Exception {
-				if (task.getLocation().getPath().endsWith(".jar")) {
-					return;
-				}
-				this.delegate.get(task);
-			}
-
-			@Override
-			public void put(PutTask task) throws Exception {
-				this.delegate.put(task);
-			}
-
-			@Override
-			public void close() {
-				this.delegate.close();
-			}
-
-		}
-
-	}
-
 }
